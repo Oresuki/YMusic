@@ -193,7 +193,7 @@
   </div>
 
   <form class="cari" id="form">
-    <input type="text" id="url" placeholder="Tempel link YouTube, atau ketik: nama band + judul lagu" autocomplete="off">
+    <input type="text" id="url" placeholder="Tempel link YouTube / playlist, atau ketik: nama band + judul lagu" autocomplete="off">
     <button class="tombol" type="submit">▶ Putar</button>
   </form>
   <div class="status" id="status"></div>
@@ -228,6 +228,12 @@
         <b id="offLabel">+0.0s</b>
         <button type="button" id="maju" title="Lirik lebih cepat">+</button>
       </div>
+      <div class="sync" id="plKontrol" style="display:none">
+        Playlist:
+        <button type="button" id="plPrev" title="Lagu sebelumnya">⏮</button>
+        <b id="plInfo">– / –</b>
+        <button type="button" id="plNext" title="Lagu berikutnya">⏭</button>
+      </div>
     </div>
 
     <div class="lirik" id="lirik"></div>
@@ -242,9 +248,11 @@
   const metaJudul = $("#metaJudul"), metaArtis = $("#metaArtis"), metaSumber = $("#metaSumber");
   const offLabel = $("#offLabel");
   const pilihan = $("#pilihan");
+  const plKontrol = $("#plKontrol"), plInfo = $("#plInfo");
 
   let player = null, apiPromise = null, playerSiap = false;
   let idSekarang = null;
+  let modePlaylist = false, vMulai = null, tokenCari = 0;
   let baris = [], els = [], sinkron = false, aktifIdx = -2;
   let offset = 0, manualUntil = 0;
 
@@ -301,16 +309,28 @@
     153: "Error 153: halaman ini dibuka dari file lokal sehingga YouTube menolak memutarnya. Buka lewat Live Server / server lokal (lihat petunjuk kuning di atas)."
   };
 
-  function buatPlayer(id) {
+  function buatPlayer(id, listId) {
     return new Promise((res) => {
       const vars = { autoplay: 1, playsinline: 1, rel: 0 };
       if (location.protocol.startsWith("http")) vars.origin = location.origin;
+      if (listId) { vars.listType = "playlist"; vars.list = listId; }
+      const opsi = { playerVars: vars };
+      if (id) opsi.videoId = id;
       player = new YT.Player("player", {
-        videoId: id,
-        playerVars: vars,
+        ...opsi,
         events: {
           onReady: (e) => { playerSiap = true; try { e.target.playVideo(); } catch (x) {} res(); },
-          onError: (e) => setStatus(PESAN_ERROR[e.data] || "Video gagal diputar (kode " + e.data + ").", "err")
+          onError: (e) => {
+            let msg = PESAN_ERROR[e.data] || "Video gagal diputar (kode " + e.data + ").";
+            if (modePlaylist && idSekarang === null && (e.data === 2 || e.data === 100)) {
+              msg = "Playlist tidak ditemukan, bersifat privat, atau tidak bisa di-embed (playlist Mix otomatis tidak didukung). " +
+                    "Pastikan link-nya lengkap dan playlist-nya Publik atau Tidak publik.";
+            } else if (modePlaylist && idSekarang !== null && [100, 101, 150].includes(e.data)) {
+              msg += " Melompat ke lagu berikutnya…";
+              setTimeout(() => { try { player.nextVideo(); } catch (x) {} }, 1500);
+            }
+            setStatus(msg, "err");
+          }
         }
       });
     });
@@ -492,7 +512,9 @@
 
     let dur = 0;
     try { dur = player.getDuration() || 0; } catch (e) {}
+    const token = ++tokenCari;
     const hasil = await cariLirik(artis, judul, dur);
+    if (token !== tokenCari) return;   // sudah ganti lagu, abaikan hasil lama
 
     if (!hasil) {
       tampilkanKosong("Lirik tidak ditemukan.<br>Coba ubah judul/artis di <b>Pengaturan lanjutan</b>, atau tempel lirik sendiri.");
@@ -512,6 +534,8 @@
     e.preventDefault();
     const teksMasuk = inUrl.value.trim();
     if (!teksMasuk) return setStatus("Isi link YouTube, atau ketik nama band + judul lagu.", "err");
+    const pl = ambilList(teksMasuk);
+    if (pl) return putarPlaylist(pl.list, pl.v);   // link playlist
     const id = ambilId(teksMasuk);
     if (!id) return cariLagu(teksMasuk);   // bukan link → anggap nama lagu
     pilihan.classList.remove("tampil");
@@ -519,6 +543,9 @@
   });
 
   async function putarId(id, metaAwal) {
+    modePlaylist = false;
+    plKontrol.style.display = "none";
+    tokenCari++;
     setStatus("Memuat lagu…");
     tampilkanKosong("Memuat lagu…");
     try { await muatAPI(); } catch (err) { return setStatus(err.message, "err"); }
@@ -594,6 +621,9 @@
     inJudul.value = ""; inArtis.value = "";
     metaJudul.textContent = "—"; metaArtis.textContent = ""; metaSumber.textContent = "";
     $("#linkYT").style.display = "none";
+    modePlaylist = false; vMulai = null;
+    plKontrol.style.display = "none";
+    tokenCari++;
     baris = []; els = []; sinkron = false; aktifIdx = -2;
     idSekarang = null;
   }
@@ -631,6 +661,73 @@
     tampilkanPilihan(list, 0);
     await putarId(list[0].id, { title: list[0].title, author: list[0].author });
   }
+
+  // ============================================================
+  //  PLAYLIST
+  // ============================================================
+  function ambilList(s) {
+    try {
+      const u = new URL(/^https?:\/\//i.test(s) ? s : "https://" + s);
+      if (!/youtu/.test(u.hostname)) return null;
+      const l = u.searchParams.get("list");
+      if (l && /^[\w-]{10,}$/.test(l)) return { list: l, v: ambilId(s) };
+    } catch (e) {}
+    return null;
+  }
+
+  async function putarPlaylist(listId, vAwal) {
+    pilihan.classList.remove("tampil");
+    resetLagu();
+    modePlaylist = true;
+    vMulai = vAwal || null;
+    setStatus("Memuat playlist…");
+    tampilkanKosong("Memuat playlist…");
+    try { await muatAPI(); } catch (err) { modePlaylist = false; return setStatus(err.message, "err"); }
+    if (!player) await buatPlayer(null, listId);
+    else { try { player.loadPlaylist({ list: listId, listType: "playlist", index: 0 }); } catch (x) {} }
+    plKontrol.style.display = "flex";
+    plInfo.textContent = "– / –";
+    tampilkanKosong("Menunggu lagu pertama dari playlist…");
+    setStatus("Playlist dimuat.");
+  }
+
+  function gantiTrack(d) {
+    idSekarang = d.video_id;
+    baris = []; els = []; sinkron = false; aktifIdx = -2;
+    const t = tebak({ title: d.title, author: d.author || "" });
+    inJudul.value = t.judul;
+    inArtis.value = t.artis;
+    const linkYT = $("#linkYT");
+    linkYT.href = "https://www.youtube.com/watch?v=" + d.video_id;
+    linkYT.style.display = "inline";
+    tampilkanKosong("Mencari lirik…");
+    cariDanTampil();
+  }
+
+  // pantau lagu yang sedang diputar di playlist (otomatis ikut ganti saat lagu berikutnya mulai)
+  setInterval(() => {
+    if (!modePlaylist || !player || !playerSiap) return;
+    let d;
+    try { d = player.getVideoData(); } catch (e) { return; }
+    try {
+      const arr = player.getPlaylist() || [];
+      if (arr.length) plInfo.textContent = (player.getPlaylistIndex() + 1) + " / " + arr.length;
+    } catch (e) {}
+    if (!d || !d.video_id || !d.title || d.video_id === idSekarang) return;
+    if (vMulai) {   // link berisi lagu tertentu di dalam playlist → lompat ke sana
+      const target = vMulai; vMulai = null;
+      if (target !== d.video_id) {
+        try {
+          const i = (player.getPlaylist() || []).indexOf(target);
+          if (i >= 0) { player.playVideoAt(i); return; }
+        } catch (e) {}
+      }
+    }
+    gantiTrack(d);
+  }, 1000);
+
+  $("#plPrev").addEventListener("click", () => { try { player.previousVideo(); } catch (e) {} });
+  $("#plNext").addEventListener("click", () => { try { player.nextVideo(); } catch (e) {} });
 
   $("#btnCari").addEventListener("click", cariDanTampil);
 
