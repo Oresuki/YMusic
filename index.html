@@ -88,6 +88,27 @@
   .lanjut textarea { min-height: 110px; resize: vertical; width: 100%; flex: none; }
   .lanjut small { color: rgba(255, 255, 255, .55); }
 
+  /* ===== Hasil pencarian lagu ===== */
+  .pilihan { display: none; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .pilihan.tampil { display: flex; }
+  .pilihan .plabel { font-size: .82rem; color: rgba(255, 255, 255, .55); }
+  .chip {
+    max-width: 100%;
+    padding: 7px 12px;
+    font: inherit;
+    font-size: .82rem;
+    color: rgba(255, 255, 255, .8);
+    background: var(--kartu);
+    border: 1px solid var(--garis);
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chip:hover { border-color: var(--aksen); }
+  .chip.on { background: rgba(255, 122, 168, .18); border-color: var(--aksen); color: #fff; }
+
   /* ===== Tampilan utama ===== */
   .utama { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 20px; align-items: start; }
   .kiri { position: sticky; top: 16px; display: grid; gap: 12px; }
@@ -172,10 +193,11 @@
   </div>
 
   <form class="cari" id="form">
-    <input type="text" id="url" placeholder="Tempel link YouTube di sini…" value="https://youtu.be/kmfqqVze1MA" autocomplete="off">
+    <input type="text" id="url" placeholder="Tempel link YouTube, atau ketik: nama band + judul lagu" autocomplete="off">
     <button class="tombol" type="submit">▶ Putar</button>
   </form>
   <div class="status" id="status"></div>
+  <div class="pilihan" id="pilihan"></div>
 
   <details class="lanjut">
     <summary>Pengaturan lanjutan (judul/artis, lirik manual)</summary>
@@ -187,7 +209,7 @@
       </div>
       <textarea id="manual" placeholder="Atau tempel lirik sendiri di sini. Format LRC ([00:12.50] baris) akan ikut tersinkron, teks biasa akan tampil tanpa sinkron."></textarea>
       <div><button class="tombol abu" type="button" id="btnManual">Pakai lirik ini</button></div>
-      <small>Tips: kalau lirik tidak ketemu, coba ubah judul/artis sesuai nama aslinya (tanpa "Official Video" dsb).</small>
+      <small>Tips: tombol "Cari lirik" hanya mengganti <b>lirik</b>, bukan videonya. Untuk mengganti lagu, ketik band + judul atau tempel link baru di kolom paling atas. Kalau lirik tidak ketemu, coba ubah judul/artis sesuai nama aslinya (tanpa "Official Video" dsb).</small>
     </div>
   </details>
 
@@ -219,6 +241,7 @@
   const statusEl = $("#status"), box = $("#lirik"), taManual = $("#manual");
   const metaJudul = $("#metaJudul"), metaArtis = $("#metaArtis"), metaSumber = $("#metaSumber");
   const offLabel = $("#offLabel");
+  const pilihan = $("#pilihan");
 
   let player = null, apiPromise = null, playerSiap = false;
   let idSekarang = null;
@@ -244,7 +267,7 @@
   // ============================================================
   function ambilId(s) {
     s = (s || "").trim();
-    if (/^[\w-]{11}$/.test(s)) return s;
+    if (/^(?=.*[\d_A-Z-])[\w-]{11}$/.test(s)) return s;
     try {
       const u = new URL(/^https?:\/\//i.test(s) ? s : "https://" + s);
       if (u.hostname.includes("youtu.be")) return u.pathname.slice(1, 12);
@@ -487,9 +510,15 @@
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const id = ambilId(inUrl.value);
-    if (!id) return setStatus("Link YouTube tidak dikenali. Contoh: https://youtu.be/xxxxxxxxxxx", "err");
+    const teksMasuk = inUrl.value.trim();
+    if (!teksMasuk) return setStatus("Isi link YouTube, atau ketik nama band + judul lagu.", "err");
+    const id = ambilId(teksMasuk);
+    if (!id) return cariLagu(teksMasuk);   // bukan link → anggap nama lagu
+    pilihan.classList.remove("tampil");
+    await putarId(id, null);
+  });
 
+  async function putarId(id, metaAwal) {
     setStatus("Memuat lagu…");
     tampilkanKosong("Memuat lagu…");
     try { await muatAPI(); } catch (err) { return setStatus(err.message, "err"); }
@@ -503,7 +532,7 @@
     linkYT.style.display = "inline";
 
     if (!inJudul.value.trim()) {
-      const meta = await ambilMeta(id);
+      const meta = metaAwal || await ambilMeta(id);
       if (meta) {
         const t = tebak(meta);
         inJudul.value = t.judul;
@@ -511,7 +540,97 @@
       }
     }
     await cariDanTampil();
-  });
+  }
+
+  // ============================================================
+  //  CARI LAGU LEWAT NAMA (band + judul)
+  // ============================================================
+  const YT_API_KEY = "";  // OPSIONAL: isi API key YouTube Data API v3 supaya pencarian lebih stabil
+  const PIPED = [         // cadangan tanpa API key (server publik, bisa sewaktu-waktu mati)
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.private.coffee"
+  ];
+
+  const dekode = (s) => { const t = document.createElement("textarea"); t.innerHTML = s; return t.value; };
+  const aman = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  async function cariVideo(q) {
+    if (YT_API_KEY) {
+      try {
+        const r = await fetchTimeout("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=5&q=" +
+          encodeURIComponent(q) + "&key=" + YT_API_KEY, 8000);
+        if (r.ok) {
+          const j = await r.json();
+          const list = (j.items || []).filter((x) => x.id && x.id.videoId).map((x) => ({
+            id: x.id.videoId, title: dekode(x.snippet.title), author: dekode(x.snippet.channelTitle)
+          }));
+          if (list.length) return list;
+        }
+      } catch (e) {}
+    }
+    for (const base of PIPED) {
+      try {
+        const r = await fetchTimeout(base + "/search?q=" + encodeURIComponent(q) + "&filter=videos", 6000);
+        if (!r.ok) continue;
+        const j = await r.json();
+        const list = (j.items || [])
+          .filter((x) => x.url && x.url.includes("/watch?v="))
+          .slice(0, 5)
+          .map((x) => ({
+            id: x.url.split("v=")[1].slice(0, 11),
+            title: x.title || "",
+            author: (x.uploaderName || "").replace(/\s*-\s*Topic$/i, "")
+          }));
+        if (list.length) return list;
+      } catch (e) {}
+    }
+    return [];
+  }
+
+  // bersihkan sisa lagu sebelumnya supaya tidak "menempel"
+  function resetLagu() {
+    try { if (player && playerSiap) player.stopVideo(); } catch (e) {}
+    inJudul.value = ""; inArtis.value = "";
+    metaJudul.textContent = "—"; metaArtis.textContent = ""; metaSumber.textContent = "";
+    $("#linkYT").style.display = "none";
+    baris = []; els = []; sinkron = false; aktifIdx = -2;
+    idSekarang = null;
+  }
+
+  function tampilkanPilihan(list, aktif) {
+    pilihan.innerHTML = '<span class="plabel">Hasil pencarian (klik untuk ganti versi):</span>';
+    list.forEach((v, i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip" + (i === aktif ? " on" : "");
+      b.textContent = v.title + (v.author ? " — " + v.author : "");
+      b.title = v.title;
+      b.addEventListener("click", () => {
+        tampilkanPilihan(list, i);
+        putarId(v.id, { title: v.title, author: v.author });
+      });
+      pilihan.appendChild(b);
+    });
+    pilihan.classList.add("tampil");
+  }
+
+  async function cariLagu(q) {
+    resetLagu();
+    pilihan.classList.remove("tampil");
+    tampilkanKosong("Mencari lagu…");
+    setStatus("Mencari lagu “" + q + "”…");
+    const list = await cariVideo(q);
+    if (!list.length) {
+      const yt = "https://www.youtube.com/results?search_query=" + encodeURIComponent(q);
+      tampilkanKosong("Pencarian video otomatis tidak berhasil.<br>" +
+        '<a href="' + yt + '" target="_blank" rel="noopener" style="color:#ff9fc0">Cari “' + aman(q) + "” di YouTube ↗</a>, " +
+        "lalu tempel link videonya di kolom di atas.");
+      return setStatus("Video tidak ditemukan lewat pencarian otomatis.", "err");
+    }
+    tampilkanPilihan(list, 0);
+    await putarId(list[0].id, { title: list[0].title, author: list[0].author });
+  }
 
   $("#btnCari").addEventListener("click", cariDanTampil);
 
